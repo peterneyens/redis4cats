@@ -28,7 +28,7 @@ import fs2.concurrent.Topic
   *   subscriber count, when `subscribers` reaches 0 `cleanup` is called and `None` is published to the topic.
   */
 final private[redis4cats] case class Redis4CatsSubscription[F[_], V](
-    topic: Topic[F, Option[V]],
+    topic: Topic[F, V],
     subscribers: Long,
     cleanup: F[Unit]
 ) {
@@ -41,5 +41,5 @@ final private[redis4cats] case class Redis4CatsSubscription[F[_], V](
   def stream(onTermination: F[Unit])(
       implicit F: Applicative[F]
   ): fs2.Stream[F, V] =
-    topic.subscribe(500).unNoneTerminate.onFinalize(onTermination)
+    topic.subscribe(500).onFinalize(onTermination)
 }

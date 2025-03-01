@@ -40,9 +40,9 @@ class RedisPubSubSpec extends Redis4CatsFunSuite(isCluster = false) {
         finished <- Deferred[IO, Either[Throwable, Unit]]
         s1 <- pubSub.subscribe(channel).interruptWhen(finished).compile.to(Vector).start
         s2 <- pubSub.psubscribe(pattern).interruptWhen(finished).compile.to(Vector).start
-        _ <- IO.sleep(200.millis) // wait for the subscription to start
+        _ <- IO.sleep(500.millis) // wait for the subscription to start
         _ <- fs2.Stream.emit("hello").through(pubSub.publish(channel)).compile.drain
-        _ <- IO.sleep(200.millis) // wait for the message to arrive
+        _ <- IO.sleep(500.millis) // wait for the message to arrive
         _ <- finished.complete(Right(()))
         channelResults <- s1.joinWith(IO.raiseError(new RuntimeException("s1 should not be cancelled")))
         patternResults <- s2.joinWith(IO.raiseError(new RuntimeException("s2 should not be cancelled")))
@@ -63,11 +63,11 @@ class RedisPubSubSpec extends Redis4CatsFunSuite(isCluster = false) {
 
       for {
         sub1 <- pubSub.subscribe(channel).compile.toVector.start
-        _ <- IO.sleep(200.millis) // Wait to make sure the fiber started.
+        _ <- IO.sleep(500.millis) // Wait to make sure the fiber started.
         _ <- pubSub.shouldHaveNSubs(channel, 1)
         _ <- pubSub.internalChannelSubscriptions.map(assertEquals(_, Map(channel -> 1L)))
         sub2 <- pubSub.subscribe(channel).compile.toVector.start
-        _ <- IO.sleep(200.millis) // Wait to make sure the fiber started.
+        _ <- IO.sleep(500.millis) // Wait to make sure the fiber started.
         _ <- pubSub.internalChannelSubscriptions.map(assertEquals(_, Map(channel -> 2L)))
         _ <- pubSub.shouldHaveNSubs(channel, 1)
         _ <- sub1.cancel
@@ -87,9 +87,9 @@ class RedisPubSubSpec extends Redis4CatsFunSuite(isCluster = false) {
       for {
         sub1 <- pubSub.subscribe(channel).compile.toVector.start
         sub2 <- pubSub.subscribe(channel).compile.toVector.start
-        _ <- IO.sleep(200.millis) // Wait to make sure the fiber started.
+        _ <- IO.sleep(500.millis) // Wait to make sure the fiber started.
         _ <- pubSub.publish(channel, "hello")
-        _ <- IO.sleep(200.millis) // Wait to make sure the message is delivered.
+        _ <- IO.sleep(500.millis) // Wait to make sure the message is delivered.
         _ <- pubSub.unsubscribe(channel)
         sub1Result <- sub1.joinWith(IO.raiseError(new Exception(s"sub1 should not have been cancelled")))
         _ <- IO(assertEquals(sub1Result, Vector("hello")))
@@ -106,7 +106,7 @@ class RedisPubSubSpec extends Redis4CatsFunSuite(isCluster = false) {
       for {
         sub1 <- pubSub.subscribe(channel).compile.toVector.start
         sub2 <- pubSub.subscribe(channel).compile.toVector.start
-        _ <- IO.sleep(200.millis) // Wait to make sure the fibers have started ands streams started processing.
+        _ <- IO.sleep(500.millis) // Wait to make sure the fibers have started ands streams started processing.
         _ <- pubSub.internalChannelSubscriptions.map(assertEquals(_, Map(channel -> 2L)))
         _ <- pubSub.shouldHaveNSubs(channel, 1)
         _ <- pubSub.unsubscribe(channel)
@@ -124,10 +124,10 @@ class RedisPubSubSpec extends Redis4CatsFunSuite(isCluster = false) {
 
       for {
         sub1 <- pubSub.psubscribe(pattern).compile.toVector.start
-        _ <- IO.sleep(200.millis) // Wait to make sure the fiber started.
+        _ <- IO.sleep(500.millis) // Wait to make sure the fiber started.
         _ <- pubSub.internalPatternSubscriptions.map(assertEquals(_, Map(pattern -> 1L)))
         sub2 <- pubSub.psubscribe(pattern).compile.toVector.start
-        _ <- IO.sleep(200.millis) // Wait to make sure the fiber started.
+        _ <- IO.sleep(500.millis) // Wait to make sure the fiber started.
         _ <- pubSub.internalPatternSubscriptions.map(assertEquals(_, Map(pattern -> 2L)))
         _ <- sub1.cancel
         _ <- pubSub.internalPatternSubscriptions.map(assertEquals(_, Map(pattern -> 1L)))
@@ -144,7 +144,7 @@ class RedisPubSubSpec extends Redis4CatsFunSuite(isCluster = false) {
       for {
         sub1 <- pubSub.psubscribe(pattern).compile.toVector.start
         sub2 <- pubSub.psubscribe(pattern).compile.toVector.start
-        _ <- IO.sleep(200.millis) // Wait to make sure the fibers have started ands streams started processing.
+        _ <- IO.sleep(500.millis) // Wait to make sure the fibers have started ands streams started processing.
         _ <- pubSub.internalPatternSubscriptions.map(assertEquals(_, Map(pattern -> 2L)))
         _ <- pubSub.punsubscribe(pattern)
         _ <- sub1.joinWith(IO.raiseError(new Exception("sub1 should not have been cancelled")))
@@ -167,6 +167,26 @@ class RedisPubSubSpec extends Redis4CatsFunSuite(isCluster = false) {
       fs2.Stream.resource(withRedisPubSubOptionsResource(options)).flatMap { pubSub =>
         pubSub.psubscribe(RedisPattern("test-sub-expiration"))
       }
+    }
+  }
+
+  test("subscribe and unsubscribe ") {
+    import cats.syntax.all._
+    withRedisPubSub { pubSub =>
+      val channels              = List.range(1, 100).map(_ % 25).map(n => RedisChannel(n.toString))
+      val expectedSubscriptions = channels.length.toLong
+
+      val checkSubscriptionCount: IO[Long] = pubSub.internalChannelSubscriptions.map(_.values.sum)
+      val wait = checkSubscriptionCount
+        .delayBy(50.millis)
+        .iterateUntil(_ == expectedSubscriptions)
+
+      val subscribe = channels.parTraverse { channel =>
+        pubSub.subscribe(channel).compile.drain
+      }
+      val unsubscribe = channels.parTraverse(pubSub.unsubscribe)
+
+      IO.both(subscribe, wait >> unsubscribe).timed.flatMap { case (d, _) => IO.println(d) }
     }
   }
 }

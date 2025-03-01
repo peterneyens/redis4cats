@@ -39,9 +39,7 @@ private[pubsub] class Subscriber[F[_]: Async: FutureLift: Log, K, V](
       subConnection,
       subscribeToRedis = FutureLift[F].lift(subConnection.async().subscribe(channel.underlying)).void,
       unsubscribeFromRedis = FutureLift[F].lift(subConnection.async().unsubscribe(channel.underlying)).void
-    )((dispatcher, topic) =>
-      PubSubInternals.channelListener(channel, (v: V) => topic.publish1(Some(v)).void, dispatcher)
-    )
+    )((dispatcher, topic) => PubSubInternals.channelListener(channel, (v: V) => topic.publish1(v).void, dispatcher))
 
   override def unsubscribe(channel: RedisChannel[K]): F[Unit] =
     Subscriber.unsubscribeFrom(channel, state.channelSubs)
@@ -57,7 +55,7 @@ private[pubsub] class Subscriber[F[_]: Async: FutureLift: Log, K, V](
       unsubscribeFromRedis = FutureLift[F].lift(subConnection.async().punsubscribe(pattern.underlying)).void
     )((dispatcher, topic) =>
       PubSubInternals
-        .patternListener(pattern, (evt: RedisPatternEvent[K, V]) => topic.publish1(Some(evt)).void, dispatcher)
+        .patternListener(pattern, (evt: RedisPatternEvent[K, V]) => topic.publish1(evt).void, dispatcher)
     )
 
   override def punsubscribe(pattern: RedisPattern[K]): F[Unit] =
@@ -83,17 +81,19 @@ object Subscriber {
       subConnection: StatefulRedisPubSubConnection[K, V],
       subscribeToRedis: F[Unit],
       unsubscribeFromRedis: F[Unit]
-  )(makeListener: (Dispatcher[F], Topic[F, Option[SubValue]]) => RedisPubSubListener[K, V]): Stream[F, SubValue] =
+  )(makeListener: (Dispatcher[F], Topic[F, SubValue]) => RedisPubSubListener[K, V]): Stream[F, SubValue] =
     state.subscribe(key) {
       for {
         _ <- Resource.eval(Log[F].info(s"Creating subscription for $key"))
         // We use parallel dispatcher because multiple subscribers can be interested in the same key
-        dispatcher <- Dispatcher.parallel[F]
-        topic <- Resource.eval(Topic[F, Option[SubValue]])
-        _ <- Resource.make {
-               val listener = makeListener(dispatcher, topic)
-               Sync[F].delay(subConnection.addListener(listener)).as(listener)
-             }(listener => Sync[F].delay(subConnection.removeListener(listener)))
+        // dispatcher <- Dispatcher.parallel[F]
+        topic <- Resource.eval(Topic[F, SubValue])
+        // _ <- Resource.make {
+        //        // TODO: we should probably only have a single listener?
+        //        // since messages get sent to all listeners
+        //        val listener = makeListener(dispatcher, topic)
+        //        Sync[F].delay(subConnection.addListener(listener)).as(listener)
+        //      }(listener => Sync[F].delay(subConnection.removeListener(listener)))
         _ <- Resource.make(subscribeToRedis)(_ => unsubscribeFromRedis)
         _ <- Resource.eval(Log[F].debug(s"Created subscription for $key"))
       } yield topic
