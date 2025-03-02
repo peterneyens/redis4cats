@@ -56,10 +56,9 @@ object PubSub {
     val (acquire, release) = acquireAndRelease[F, K, V](client, codec)
     // One exclusive connection for subscriptions and another connection for publishing / stats
     for {
-      sConn <- Resource.make(acquire)(release)
+      subCommands <- Resource.make(acquire)(release).flatMap(Subscriber.make[F, K, V])
       pConn <- Resource.make(acquire)(release)
-      state <- PubSubState.make[F, K, V](shards = None, sConn)
-    } yield new LivePubSubCommands[F, K, V](state, sConn, pConn)
+    } yield new LivePubSubCommands[F, K, V](subCommands, pConn)
   }
 
   /** Creates a PubSub connection.
@@ -83,10 +82,7 @@ object PubSub {
       codec: RedisCodec[K, V]
   ): Resource[F, SubscribeCommands[F, Stream[F, *], K, V]] = {
     val (acquire, release) = acquireAndRelease[F, K, V](client, codec)
-    for {
-      conn <- Resource.make(acquire)(release)
-      state <- PubSubState.make[F, K, V](shards = None, conn)
-    } yield new Subscriber(state, conn)
+    Resource.make(acquire)(release).flatMap(Subscriber.make[F, K, V])
   }
 
 }

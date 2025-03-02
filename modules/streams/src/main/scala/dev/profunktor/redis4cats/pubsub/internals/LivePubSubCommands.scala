@@ -29,13 +29,10 @@ import fs2.Stream
 import io.lettuce.core.pubsub.StatefulRedisPubSubConnection
 
 private[pubsub] class LivePubSubCommands[F[_]: Async: Log, K, V](
-    state: PubSubState[F, K, V],
-    subConnection: StatefulRedisPubSubConnection[K, V],
+    subCommands: SubscribeCommands[F, Stream[F, *], K, V],
     pubConnection: StatefulRedisPubSubConnection[K, V]
 ) extends PubSubCommands[F, Stream[F, *], K, V] {
 
-  private[redis4cats] val subCommands: SubscribeCommands[F, Stream[F, *], K, V] =
-    new Subscriber[F, K, V](state, subConnection)
   private[redis4cats] val pubSubStats: PubSubStats[F, K] = new LivePubSubStats(pubConnection)
 
   override def subscribe(channel: RedisChannel[K]): Stream[F, V] =
