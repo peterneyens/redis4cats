@@ -24,11 +24,11 @@ import dev.profunktor.redis4cats.data.RedisChannel
 import dev.profunktor.redis4cats.data.RedisPattern
 import dev.profunktor.redis4cats.data.RedisPatternEvent
 import dev.profunktor.redis4cats.pubsub.data.Subscription
-import dev.profunktor.redis4cats.effect.{ FutureLift, Log }
+import dev.profunktor.redis4cats.effect.FutureLift
 import fs2.Stream
 import io.lettuce.core.pubsub.StatefulRedisPubSubConnection
 
-private[pubsub] class LivePubSubCommands[F[_]: Async: Log, K, V](
+private[pubsub] class LivePubSubCommands[F[_]: Async, K, V](
     subCommands: SubscribeCommands[F, Stream[F, *], K, V],
     pubConnection: StatefulRedisPubSubConnection[K, V]
 ) extends PubSubCommands[F, Stream[F, *], K, V] {
