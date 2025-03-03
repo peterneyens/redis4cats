@@ -18,7 +18,7 @@ package dev.profunktor.redis4cats
 package pubsub
 package internals
 
-import cats.{ Applicative, ApplicativeThrow }
+import cats.{ Applicative, ApplicativeThrow, Functor }
 import cats.effect.kernel._
 import cats.effect.std.{ Dispatcher, MapRef }
 import cats.syntax.all._
@@ -28,18 +28,12 @@ import fs2.Stream
 import fs2.concurrent.Topic
 import io.lettuce.core.pubsub.{ RedisPubSubAdapter, RedisPubSubListener, StatefulRedisPubSubConnection }
 
-private[pubsub] class Subscriber[F[_]: Async: FutureLift: Log, K, V] private (
-    private val state: Subscriber.State[F, K, V],
-    private val subConnection: StatefulRedisPubSubConnection[K, V]
+private[pubsub] class Subscriber[F[_], K, V] private (
+    private val state: Subscriber.State[F, K, V]
 ) extends SubscribeCommands[F, Stream[F, *], K, V] {
 
   override def subscribe(channel: RedisChannel[K]): Stream[F, V] =
-    Subscriber.subscribe(
-      channel,
-      state.channelSubs,
-      subscribeToRedis = FutureLift[F].lift(subConnection.async().subscribe(channel.underlying)).void,
-      unsubscribeFromRedis = FutureLift[F].lift(subConnection.async().unsubscribe(channel.underlying)).void
-    )
+    state.channelSubs.subscribe(channel)
 
   override def unsubscribe(channel: RedisChannel[K]): F[Unit] =
     state.channelSubs.unsubscribe(channel)
@@ -47,12 +41,7 @@ private[pubsub] class Subscriber[F[_]: Async: FutureLift: Log, K, V] private (
   override def psubscribe(
       pattern: RedisPattern[K]
   ): Stream[F, RedisPatternEvent[K, V]] =
-    Subscriber.subscribe(
-      pattern,
-      state.patternSubs,
-      subscribeToRedis = FutureLift[F].lift(subConnection.async().psubscribe(pattern.underlying)).void,
-      unsubscribeFromRedis = FutureLift[F].lift(subConnection.async().punsubscribe(pattern.underlying)).void
-    )
+    state.patternSubs.subscribe(pattern)
 
   override def punsubscribe(pattern: RedisPattern[K]): F[Unit] =
     state.patternSubs.unsubscribe(pattern)
@@ -71,7 +60,12 @@ object Subscriber {
   ): Resource[F, SubscribeCommands[F, Stream[F, *], K, V]] =
     for {
       dispatcher <- Dispatcher.parallel[F]
-      state <- Resource.eval(State.fromRefs[F, K, V])
+      state <- Resource.eval(
+                 State.fromRefs[F, K, V](
+                   channelCommands = SubscriptionCommands.channel(subConnection),
+                   patternCommands = SubscriptionCommands.pattern(subConnection)
+                 )
+               )
       // We only use a single listener for all channels and patterns.
       // Since we have a map of all subscriptions, we can dispatch messages to
       // the right topic directly.
@@ -82,21 +76,21 @@ object Subscriber {
              val listener = State.listener(state, dispatcher)
              Sync[F].delay(subConnection.addListener(listener)).as(listener)
            }(listener => Sync[F].delay(subConnection.removeListener(listener)))
-    } yield new Subscriber(state, subConnection)
+    } yield new Subscriber(state)
 
-  private def subscribe[F[_]: Async: Log, TypedKey, SubValue, K, V](
-      key: TypedKey,
-      state: SubscriptionMap[F, TypedKey, SubValue],
-      subscribeToRedis: F[Unit],
-      unsubscribeFromRedis: F[Unit]
-  ): Stream[F, SubValue] =
-    state.subscribe(key) {
-      Resource.eval(Log[F].info(s"Creating subscription for $key")) >>
-        Resource.make(
-          subscribeToRedis
-        )(_ => unsubscribeFromRedis <* Log[F].debug(s"Unsubscribed from $key")) >>
-        Resource.eval(Log[F].debug(s"Created subscription for $key"))
-    }
+  // private def subscribe[F[_]: Async: Log, TypedKey, SubValue, K, V](
+  //     key: TypedKey,
+  //     state: SubscriptionMap[F, TypedKey, SubValue],
+  //     subscribeToRedis: F[Unit],
+  //     unsubscribeFromRedis: F[Unit]
+  // ): Stream[F, SubValue] =
+  //   state.subscribe(key) {
+  //     Resource.eval(Log[F].info(s"Creating subscription for $key")) >>
+  //       Resource.make(
+  //         subscribeToRedis
+  //       )(_ => unsubscribeFromRedis <* Log[F].debug(s"Unsubscribed from $key")) >>
+  //       Resource.eval(Log[F].debug(s"Created subscription for $key"))
+  //   }
 
   /** Stores an ongoing subscription.
     *
@@ -129,10 +123,13 @@ object Subscriber {
   )
 
   private object State {
-    def fromRefs[F[_]: Concurrent: Log, K, V]: F[State[F, K, V]] =
+    def fromRefs[F[_]: Concurrent: Log, K, V](
+        channelCommands: SubscriptionCommands[F, RedisChannel[K]],
+        patternCommands: SubscriptionCommands[F, RedisPattern[K]]
+    ): F[State[F, K, V]] =
       (
-        SubscriptionMap.makeRef[F, RedisChannel[K], V],
-        SubscriptionMap.makeRef[F, RedisPattern[K], RedisPatternEvent[K, V]]
+        SubscriptionMap.makeRef[F, RedisChannel[K], V](channelCommands),
+        SubscriptionMap.makeRef[F, RedisPattern[K], RedisPatternEvent[K, V]](patternCommands)
       ).mapN(apply)
 
     def listener[F[_], K, V](
@@ -157,10 +154,37 @@ object Subscriber {
       }
   }
 
+  private trait SubscriptionCommands[F[_], K] {
+    def subscribe(key: K): F[Unit]
+    def unsubscribe(key: K): F[Unit]
+  }
+
+  private object SubscriptionCommands {
+    def channel[F[_]: FutureLift: Functor, K, V](
+        subConnection: StatefulRedisPubSubConnection[K, V]
+    ): SubscriptionCommands[F, RedisChannel[K]] =
+      new SubscriptionCommands[F, RedisChannel[K]] {
+        override def subscribe(key: RedisChannel[K]): F[Unit] =
+          FutureLift[F].lift(subConnection.async().subscribe(key.underlying)).void
+        override def unsubscribe(key: RedisChannel[K]): F[Unit] =
+          FutureLift[F].lift(subConnection.async().unsubscribe(key.underlying)).void
+      }
+
+    def pattern[F[_]: FutureLift: Functor, K, V](
+        subConnection: StatefulRedisPubSubConnection[K, V]
+    ): SubscriptionCommands[F, RedisPattern[K]] =
+      new SubscriptionCommands[F, RedisPattern[K]] {
+        override def subscribe(key: RedisPattern[K]): F[Unit] =
+          FutureLift[F].lift(subConnection.async().psubscribe(key.underlying)).void
+        override def unsubscribe(key: RedisPattern[K]): F[Unit] =
+          FutureLift[F].lift(subConnection.async().punsubscribe(key.underlying)).void
+      }
+  }
+
   private trait SubscriptionMap[F[_], K, V] {
     def counts: F[Map[K, Long]]
 
-    def subscribe(key: K)(redisSubscribe: Resource[F, Unit]): Stream[F, V]
+    def subscribe(key: K): Stream[F, V]
 
     def unsubscribe(key: K): F[Unit]
 
@@ -199,11 +223,14 @@ object Subscriber {
         }
     }
 
-    def makeRef[F[_]: Concurrent: Log, K, V]: F[SubscriptionMap[F, K, V]] =
-      Ref[F].of(Map.empty[K, SubscriptionState[F, V]]).map(fromRef[F, K, V])
+    def makeRef[F[_]: Concurrent: Log, K, V](
+        commands: SubscriptionCommands[F, K]
+    ): F[SubscriptionMap[F, K, V]] =
+      Ref[F].of(Map.empty[K, SubscriptionState[F, V]]).map(fromRef[F, K, V](_, commands))
 
     def fromRef[F[_]: Concurrent: Log, K, V](
-        ref: Ref[F, Map[K, SubscriptionState[F, V]]]
+        ref: Ref[F, Map[K, SubscriptionState[F, V]]],
+        commands: SubscriptionCommands[F, K]
     ): SubscriptionMap[F, K, V] =
       new SubscriptionMap[F, K, V] {
         import SubscriptionState._
@@ -211,12 +238,13 @@ object Subscriber {
         private val mapRef = MapRef.fromSingleImmutableMapRef(ref)
 
         override def counts: F[Map[K, Long]] =
+          // should we include: FailedToUnsubscribe -> 0?
           ref.get.map(_.iterator.collect { case (k, Active(v)) => k -> v.subscribers }.toMap)
 
-        override def subscribe(key: K)(redisSubscribe: Resource[F, Unit]): Stream[F, V] =
-          Stream.eval(addSubscription(key)(redisSubscribe)).flatMap(_.stream(remove(key)))
+        override def subscribe(key: K): Stream[F, V] =
+          Stream.eval(addSubscription(key)).flatMap(_.stream(remove(key)))
 
-        private def addSubscription(key: K)(redisSubscribe: Resource[F, Unit]): F[Redis4CatsSubscription[F, V]] =
+        private def addSubscription(key: K): F[Redis4CatsSubscription[F, V]] =
           Deferred[F, Unit].flatMap { d =>
             val complete = d.complete(()).void
             // returning an `F[Redis4CatsSubscription[F, V]]]` so we can wait on
@@ -235,11 +263,11 @@ object Subscriber {
                   case Some(Unsubscribing(wait, _)) =>
                     // an existing subscription is getting shut down, wait and try again
                     // note we want to wait and retry outside of the uncancelable scope
-                    (subscribers, (wait >> addSubscription(key)(redisSubscribe)).pure[F])
+                    (subscribers, (wait >> addSubscription(key)).pure[F])
                   case Some(Subscribing(wait)) =>
                     // an existing subscription is getting created, wait and try again
                     // note we want to wait and retry outside of the uncancelable scope
-                    (subscribers, (wait >> addSubscription(key)(redisSubscribe)).pure[F])
+                    (subscribers, (wait >> addSubscription(key)).pure[F])
                   case Some(FailedToUnsubscribe(unsubscribe)) =>
                     // an existing subscription that we failed to unsubscribe,
                     // no need to subscribe, we only need a new topic
@@ -261,7 +289,7 @@ object Subscriber {
                     (subscribers.updated(key, Subscribing(d.get)), action)
                   case None =>
                     // No existing subscription, create a new one.
-                    val action = subscribeStateChange(key, mapRef(key), redisSubscribe, d)
+                    val action = subscribeStateChange(key, mapRef(key), d)
                     (subscribers.updated(key, Subscribing(d.get)), action.map(_.pure[F]))
                 }
               }
@@ -274,25 +302,24 @@ object Subscriber {
         private def subscribeStateChange(
             key: K,
             keyRef: Ref[F, Option[SubscriptionState[F, V]]],
-            redisSubscribe: Resource[F, Unit],
             d: Deferred[F, Unit]
         ): F[Redis4CatsSubscription[F, V]] = {
           val complete = d.complete(()).void
-          val subscribe = redisSubscribe
-            .evalMap(_ => Topic[F, V])
-            .allocated
+          val subscribe = commands
+            .subscribe(key)
+            .>>(Topic[F, V])
             .onError { case _ =>
               keyRef.flatModify {
                 case Some(Subscribing(_)) => (None, complete)
                 case other                => (other, unexpectedState(other, "after failing to subscribe"))
               }
             }
-            .flatMap { case (topic, unsubscribe) =>
-              val subscription = Redis4CatsSubscription(topic, subscribers = 1, unsubscribe)
+            .flatMap { topic =>
+              val subscription = Redis4CatsSubscription(topic, subscribers = 1, commands.unsubscribe(key))
               keyRef.flatModify {
                 case Some(Subscribing(_)) => (Some(Active(subscription)), complete.as(subscription))
                 case other =>
-                  unsubscribeStateChange(keyRef, unsubscribe, d).map(
+                  unsubscribeStateChange(keyRef, subscription.cleanup, d).map(
                     _.voidError >> unexpectedState[Redis4CatsSubscription[F, V]](
                       other,
                       "after subscribe succeeded"
