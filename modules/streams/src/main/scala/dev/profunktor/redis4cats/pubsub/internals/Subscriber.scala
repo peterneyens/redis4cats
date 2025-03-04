@@ -28,7 +28,7 @@ import fs2.Stream
 import fs2.concurrent.Topic
 import io.lettuce.core.pubsub.{ RedisPubSubAdapter, RedisPubSubListener, StatefulRedisPubSubConnection }
 
-private[pubsub] class Subscriber[F[_], K, V] private (
+private[internals] class Subscriber[F[_], K, V] private (
     private val state: Subscriber.State[F, K, V]
 ) extends SubscribeCommands[F, Stream[F, *], K, V] {
 
@@ -53,13 +53,12 @@ private[pubsub] class Subscriber[F[_], K, V] private (
     state.patternSubs.counts
 }
 
-object Subscriber {
+private[pubsub] object Subscriber {
 
   def make[F[_]: Async: FutureLift: Log, K, V](
       subConnection: StatefulRedisPubSubConnection[K, V]
   ): Resource[F, SubscribeCommands[F, Stream[F, *], K, V]] =
     for {
-      dispatcher <- Dispatcher.parallel[F]
       state <- Resource.eval(
                  State.fromMapRefs[F, K, V](
                    channelCommands = SubscriptionCommands.withLogs(SubscriptionCommands.channel(subConnection)),
@@ -72,6 +71,7 @@ object Subscriber {
       // Lettuce calls the listeners one by one (for every subscribe,
       // unsubscribe, message, ...), so using multiple listeners when we can
       // find the right subscription easily, is inefficient.
+      dispatcher <- Dispatcher.sequential[F] // we have no parallelism in the listener
       _ <- Resource.make {
              val listener = State.listener(state, dispatcher)
              Sync[F].delay(subConnection.addListener(listener)).as(listener)
@@ -118,7 +118,7 @@ object Subscriber {
       }
   }
 
-  private trait SubscriptionCommands[F[_], K] {
+  private[internals] trait SubscriptionCommands[F[_], K] {
     def subscribe(key: K): F[Unit]
     def unsubscribe(key: K): F[Unit]
   }
@@ -154,7 +154,7 @@ object Subscriber {
       }
   }
 
-  private trait SubscriptionMap[F[_], K, V] {
+  private[internals] trait SubscriptionMap[F[_], K, V] {
     def counts: F[Map[K, Long]]
 
     def subscribe(key: K): Stream[F, V]
@@ -164,8 +164,11 @@ object Subscriber {
     def onMessage(key: K, message: V): F[Unit]
   }
 
-  private object SubscriptionMap {
+  private[internals] object SubscriptionMap {
 
+    // Representing subscription states, so we can handling subscribing and
+    // unsubscribing without locking.
+    //
     // State changes:
     //
     // None => Subscribing (subscribe)
@@ -205,7 +208,7 @@ object Subscriber {
           case None                        => "no subscription"
           case Some(Active(_, _))          => "active subscription"
           case Some(Subscribing(_))        => "subscribing"
-          case Some(Unsubscribing(_))      => "unubscribing"
+          case Some(Unsubscribing(_))      => "unsubscribing"
           case Some(FailedToUnsubscribe()) => "failed to unsubscribe"
         }
     }
@@ -241,7 +244,7 @@ object Subscriber {
           fromMapRef[F, K, V](MapRef.fromSingleImmutableMapRef(ref), ref.get, commands)
         }
 
-    def fromMapRef[F[_]: Concurrent: Log, K, V](
+    private def fromMapRef[F[_]: Concurrent: Log, K, V](
         mapRef: MapRef[F, K, Option[SubscriptionState[F, V]]],
         values: F[Map[K, SubscriptionState[F, V]]],
         commands: SubscriptionCommands[F, K]
@@ -262,8 +265,13 @@ object Subscriber {
           Deferred[F, Unit].flatMap { d =>
             val complete = d.complete(()).void
             val keyRef   = mapRef(key)
-            // returning an `F[SubscriptionState.Active[F, V]]]` so we can wait on
-            // subcribing/unsubscribing to end outside of cancelation
+            // returning an `F[F[SubscriptionState.Active[F, V]]]]` so we can wait
+            // on subcribing/unsubscribing to end outside of the uncancelable
+            // region.
+            // This means that there is a subtle but very important difference
+            // between `fa.pure[F]` and `fa.map(_.pure[F])` in the code below:
+            // - in the first one `fa` will not be part the uncancelable region
+            // - in the second `fa` will be uncancelable
             keyRef
               .flatModify[F[SubscriptionState.Active[F, V]]] {
                 case Some(subscription: Active[_, _]) =>
@@ -317,9 +325,7 @@ object Subscriber {
             d: Deferred[F, Unit]
         ): F[SubscriptionState.Active[F, V]] = {
           val complete = d.complete(()).void
-          val subscribe = commands
-            .subscribe(key)
-            .>>(Topic[F, V])
+          val subscribe = (Topic[F, V] <* commands.subscribe(key))
             .onError { case _ =>
               keyRef.flatModify {
                 case Some(Subscribing(_)) => (None, complete)
@@ -425,15 +431,23 @@ object Subscriber {
         override def onMessage(key: K, message: V): F[Unit] =
           mapRef(key).get.flatMap {
             case Some(Active(topic, _)) =>
+              // if one of the topics subscriptions is behind, we wiil block
+              // other messages
               topic.publish1(message).void
-            case Some(Subscribing(wait)) =>
+            case Some(Subscribing(_)) =>
               // we should only get this when we already successfully subscribed
-              // to redis, but the state hasn't been updated yet
-              wait >> onMessage(key, message)
+              // to redis, but the state hasn't been updated yet.
+              // The previous implementation would publish to topic, but there
+              // would be no subecribers to the topic yet. So dropping the
+              // message is equivalent
+              Log[F].debug(s"Received message for $key before the subscription stream has started")
+            // We could wait until the we are done subscribing:
+            // wait >> onMessage(key, message)
+            // But that would block other messages
             case Some(Unsubscribing(_))      => Applicative[F].unit
             case Some(FailedToUnsubscribe()) => Applicative[F].unit
             case None                        =>
-              // We expect that all SUBSCRIBE commands happen through
+              // We expect that all SUBSCRIBE commands are made through
               // `subscribe`. so we should never receive message without
               // subscriptions
               Log[F].info(s"Received message for $key without subscription")
