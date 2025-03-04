@@ -18,7 +18,7 @@ package dev.profunktor.redis4cats
 package pubsub
 package internals
 
-import cats.{ Applicative, ApplicativeThrow, Functor }
+import cats.{ Applicative, ApplicativeThrow, FlatMap, Functor }
 import cats.effect.kernel._
 import cats.effect.std.{ Dispatcher, MapRef }
 import cats.syntax.all._
@@ -62,8 +62,8 @@ object Subscriber {
       dispatcher <- Dispatcher.parallel[F]
       state <- Resource.eval(
                  State.fromMapRefs[F, K, V](
-                   channelCommands = SubscriptionCommands.channel(subConnection),
-                   patternCommands = SubscriptionCommands.pattern(subConnection)
+                   channelCommands = SubscriptionCommands.withLogs(SubscriptionCommands.channel(subConnection)),
+                   patternCommands = SubscriptionCommands.withLogs(SubscriptionCommands.pattern(subConnection))
                  )
                )
       // We only use a single listener for all channels and patterns.
@@ -82,14 +82,13 @@ object Subscriber {
     *
     * @param topic
     *   single-publisher, multiple-subscribers. The same topic is reused if `subscribe` is invoked more than once. The
-    *   subscribers' streams are terminated when `None` is published.
+    *   subscribers' streams are terminated when the topic is closed.
     * @param subscribers
-    *   subscriber count, when `subscribers` reaches 0 `cleanup` is called and `None` is published to the topic.
+    *   subscriber count, when `subscribers` reaches 0 `cleanup` is called and `None` is published to the topic. TODO
     */
   private final case class Redis4CatsSubscription[F[_], V](
       topic: Topic[F, V],
-      subscribers: Long,
-      cleanup: F[Unit]
+      subscribers: Long
   ) {
     assert(subscribers > 0, s"subscribers must be > 0, was $subscribers")
 
@@ -166,20 +165,14 @@ object Subscriber {
           FutureLift[F].lift(subConnection.async().punsubscribe(key.underlying)).void
       }
 
-    // add logs
-    // private def subscribe[F[_]: Async: Log, TypedKey, SubValue, K, V](
-    //     key: TypedKey,
-    //     state: SubscriptionMap[F, TypedKey, SubValue],
-    //     subscribeToRedis: F[Unit],
-    //     unsubscribeFromRedis: F[Unit]
-    // ): Stream[F, SubValue] =
-    //   state.subscribe(key) {
-    //     Resource.eval(Log[F].info(s"Creating subscription for $key")) >>
-    //       Resource.make(
-    //         subscribeToRedis
-    //       )(_ => unsubscribeFromRedis <* Log[F].debug(s"Unsubscribed from $key")) >>
-    //       Resource.eval(Log[F].debug(s"Created subscription for $key"))
-    //   }
+    def withLogs[F[_]: FlatMap: Log, K](base: SubscriptionCommands[F, K]): SubscriptionCommands[F, K] =
+      new SubscriptionCommands[F, K] {
+        override def subscribe(key: K): F[Unit] =
+          base.subscribe(key) >> Log[F].debug(s"Subscribed to $key")
+
+        override def unsubscribe(key: K): F[Unit] =
+          base.unsubscribe(key) >> Log[F].debug(s"Unsubscribed from $key")
+      }
   }
 
   private trait SubscriptionMap[F[_], K, V] {
@@ -208,19 +201,19 @@ object Subscriber {
     private object SubscriptionState {
       final case class Active[F[_], V](subscription: Redis4CatsSubscription[F, V]) extends SubscriptionState[F, V]
       final case class Subscribing[F[_], V](done: F[Unit]) extends SubscriptionState[F, V]
-      final case class Unsubscribing[F[_], V](done: F[Unit], unsubscribe: F[Unit]) extends SubscriptionState[F, V]
+      final case class Unsubscribing[F[_], V](done: F[Unit]) extends SubscriptionState[F, V]
       // The previous implementation leaves a Redis4CatsSubscription with
       // `subscriber` set to `1` even when there are no subscribers to the Topic
       // anymore.
-      final case class FailedToUnsubscribe[F[_], V](unsubscribe: F[Unit]) extends SubscriptionState[F, V]
+      final case class FailedToUnsubscribe[F[_], V]() extends SubscriptionState[F, V]
 
       def description[F[_], A](s: Option[SubscriptionState[F, A]]): String =
         s match {
-          case None                         => "no subscription"
-          case Some(Active(_))              => "active subscription"
-          case Some(Subscribing(_))         => "subscribing"
-          case Some(Unsubscribing(_, _))    => "unubscribing"
-          case Some(FailedToUnsubscribe(_)) => "failed to unsubscribe"
+          case None                        => "no subscription"
+          case Some(Active(_))             => "active subscription"
+          case Some(Subscribing(_))        => "subscribing"
+          case Some(Unsubscribing(_))      => "unubscribing"
+          case Some(FailedToUnsubscribe()) => "failed to unsubscribe"
         }
     }
 
@@ -286,7 +279,7 @@ object Subscriber {
                       s"subscribers: ${subscription.subscribers} -> ${newSubscription.subscribers}"
                   )
                   (Some(Active(newSubscription)), log.as(newSubscription).pure[F])
-                case s @ Some(Unsubscribing(wait, _)) =>
+                case s @ Some(Unsubscribing(wait)) =>
                   // an existing subscription is getting shut down, wait and try again
                   // note we want to wait and retry outside of the uncancelable scope
                   (s, (wait >> addSubscription(key)).pure[F])
@@ -294,11 +287,11 @@ object Subscriber {
                   // an existing subscription is getting created, wait and try again
                   // note we want to wait and retry outside of the uncancelable scope
                   (s, (wait >> addSubscription(key)).pure[F])
-                case Some(FailedToUnsubscribe(unsubscribe)) =>
+                case Some(FailedToUnsubscribe()) =>
                   // an existing subscription that we failed to unsubscribe,
                   // no need to subscribe, we only need a new topic
                   val action = Topic[F, V].flatMap { topic =>
-                    val subscription = Redis4CatsSubscription(topic, subscribers = 1, unsubscribe)
+                    val subscription = Redis4CatsSubscription(topic, subscribers = 1)
                     mapRef(key).flatModify[F[Redis4CatsSubscription[F, V]]] {
                       case Some(Subscribing(_)) =>
                         (Some(Active(subscription)), complete.as(subscription.pure[F]))
@@ -340,11 +333,11 @@ object Subscriber {
               }
             }
             .flatMap { topic =>
-              val subscription = Redis4CatsSubscription(topic, subscribers = 1, commands.unsubscribe(key))
+              val subscription = Redis4CatsSubscription(topic, subscribers = 1)
               keyRef.flatModify {
                 case Some(Subscribing(_)) => (Some(Active(subscription)), complete.as(subscription))
                 case other =>
-                  unsubscribeStateChange(keyRef, subscription.cleanup, d).map(
+                  unsubscribeStateChange(key, keyRef, d).map(
                     _.voidError >> unexpectedState[Redis4CatsSubscription[F, V]](
                       other,
                       "after subscribe succeeded"
@@ -362,7 +355,7 @@ object Subscriber {
             val keyRef = mapRef(key)
             keyRef.flatModify {
               case Some(Active(sub)) =>
-                if (sub.isLastSubscriber) unsubscribeStateChange(keyRef, sub.cleanup, d)
+                if (sub.isLastSubscriber) unsubscribeStateChange(key, keyRef, d)
                 else (Some(Active(sub.removeSubscriber)), Applicative[F].unit)
               case other =>
                 // `remove` is only called from `subscribe` after we have an active subscription,
@@ -382,8 +375,8 @@ object Subscriber {
             // No subscription = nothing to do
             case None => Log[F].debug(s"Not unsubscribing from $key because we don't have a subscription")
             // Subscription already shutting down = nothing to do
-            case Some(Unsubscribing(_, _)) => Applicative[F].unit
-            // `close` will terminate all streams, which will perform cleanup
+            case Some(Unsubscribing(_)) => Applicative[F].unit
+            // `close` will terminate all streams, which will unsubscribe
             // once the last stream terminates.
             case Some(Active(sub)) =>
               // TODO: Should we unsubscribe here already?
@@ -394,7 +387,7 @@ object Subscriber {
             // wait until the subscription has started and unsubscribe
             case Some(Subscribing(wait)) => wait >> unsubscribe(key)
             // retry to unsubscribe
-            case Some(FailedToUnsubscribe(unsubscribe)) =>
+            case Some(FailedToUnsubscribe()) =>
               // unlike with the previous implementation we can retry to
               // unsubscribe. We could call `unsubscribe` before, but we would
               // never try to actually unsubscribe, since there are no topic
@@ -402,8 +395,8 @@ object Subscriber {
               Deferred[F, Unit].flatMap { d =>
                 val keyRef = mapRef(key)
                 keyRef.flatModify {
-                  case Some(FailedToUnsubscribe(unsubscribe)) => unsubscribeStateChange(keyRef, unsubscribe, d)
-                  case other                                  => (other, d.complete(()).void)
+                  case Some(FailedToUnsubscribe()) => unsubscribeStateChange(key, keyRef, d)
+                  case other                       => (other, d.complete(()).void)
                 }
               }
           }
@@ -411,25 +404,26 @@ object Subscriber {
         // unsubscribe with redis
         // move to Unsubscribing and then to None (or FailedToUnsubscribe)
         private def unsubscribeStateChange(
+            key: K,
             keyRef: Ref[F, Option[SubscriptionState[F, V]]],
-            unsubscribe: F[Unit],
             d: Deferred[F, Unit]
         ): (Option[SubscriptionState[F, V]], F[Unit]) = {
           val complete = d.complete(()).void
-          val action = unsubscribe
+          val action = commands
+            .unsubscribe(key)
             .onError { case _ =>
               keyRef.flatModify {
-                case Some(Unsubscribing(_, unsub)) => (Some(FailedToUnsubscribe(unsub)), complete)
+                case Some(Unsubscribing(_)) => (Some(FailedToUnsubscribe()), complete)
                 case other => (other, complete >> unexpectedState(other, "after unsubscribing unsuccessfully"))
               }
             }
             .>>(
               keyRef.flatModify {
-                case Some(Unsubscribing(_, _)) => (None, complete)
+                case Some(Unsubscribing(_)) => (None, complete)
                 case other => (other, complete >> unexpectedState[Unit](other, "after unsubscribing successfully"))
               }
             )
-          (Some(Unsubscribing(d.get, unsubscribe)), action)
+          (Some(Unsubscribing(d.get)), action)
         }
 
         override def onMessage(key: K, message: V): F[Unit] =
@@ -442,9 +436,9 @@ object Subscriber {
             case Some(Subscribing(wait)) =>
               // this will block the lettuce netty handler
               wait >> onMessage(key, message)
-            case Some(Unsubscribing(_, _))    => Applicative[F].unit
-            case Some(FailedToUnsubscribe(_)) => Applicative[F].unit
-            case None                         =>
+            case Some(Unsubscribing(_))      => Applicative[F].unit
+            case Some(FailedToUnsubscribe()) => Applicative[F].unit
+            case None                        =>
               // We expect that all SUBSCRIBE commands happen through
               // `subscribe`. so we should never receive message without
               // subscriptions
