@@ -61,8 +61,8 @@ private[pubsub] object Subscriber {
     for {
       state <- Resource.eval(
                  State.fromMapRefs[F, K, V](
-                   channelCommands = SubscriptionCommands.withLogs(SubscriptionCommands.channel(subConnection)),
-                   patternCommands = SubscriptionCommands.withLogs(SubscriptionCommands.pattern(subConnection))
+                   channelCommands = SubscriptionCommands.channel(subConnection),
+                   patternCommands = SubscriptionCommands.pattern(subConnection)
                  )
                )
       // We only use a single listener for all channels and patterns.
@@ -123,7 +123,7 @@ private[pubsub] object Subscriber {
     def unsubscribe(key: K): F[Unit]
   }
 
-  private object SubscriptionCommands {
+  private[internals] object SubscriptionCommands {
     def channel[F[_]: FutureLift: Functor, K, V](
         subConnection: StatefulRedisPubSubConnection[K, V]
     ): SubscriptionCommands[F, RedisChannel[K]] =
@@ -177,7 +177,7 @@ private[pubsub] object Subscriber {
     // Unsubscribing -> None (remove, unsubscribe)
     //
     // Unsubscribing -> FailedToUnsubscribe (remove)
-    // FailedToUnsubscribe -> Active (subscribe)
+    // FailedToUnsubscribe -> Subscribing (subscribe)
     // FailedToUnsubscribe -> Unsubscribing (unsubscribe)
     private sealed trait SubscriptionState[F[_], V]
     private object SubscriptionState {
@@ -263,8 +263,7 @@ private[pubsub] object Subscriber {
 
         private def addSubscription(key: K): F[SubscriptionState.Active[F, V]] =
           Deferred[F, Unit].flatMap { d =>
-            val complete = d.complete(()).void
-            val keyRef   = mapRef(key)
+            val keyRef = mapRef(key)
             // returning an `F[F[SubscriptionState.Active[F, V]]]]` so we can wait
             // on subcribing/unsubscribing to end outside of the uncancelable
             // region.
@@ -291,24 +290,9 @@ private[pubsub] object Subscriber {
                   // note we want to wait and retry outside of the uncancelable scope
                   (s, (wait >> addSubscription(key)).pure[F])
                 case Some(FailedToUnsubscribe()) =>
-                  // an existing subscription that we failed to unsubscribe,
-                  // no need to subscribe, we only need a new topic
-                  val action = Topic[F, V].flatMap { topic =>
-                    mapRef(key).flatModify[F[Active[F, V]]] {
-                      case Some(Subscribing(_)) =>
-                        val subscription = Active(topic, subscribers = 1)
-                        (Some(subscription), complete.as(subscription.pure[F]))
-                      case other =>
-                        (
-                          other,
-                          unexpectedState(
-                            other,
-                            "trying to reactivate subcription that we failed to unsubscribe from"
-                          )
-                        )
-                    }
-                  }
-                  (Some(Subscribing(d.get)), action)
+                  // unsubscribe failed, but we resubscribe to be sure
+                  val action = subscribeStateChange(key, keyRef, d)
+                  (Some(Subscribing(d.get)), action.map(_.pure[F]))
                 case None =>
                   // No existing subscription, create a new one.
                   val action = subscribeStateChange(key, keyRef, d)
@@ -437,16 +421,19 @@ private[pubsub] object Subscriber {
             case Some(Subscribing(_)) =>
               // we should only get this when we already successfully subscribed
               // to redis, but the state hasn't been updated yet.
-              // The previous implementation would publish to topic, but there
-              // would be no subecribers to the topic yet. So dropping the
-              // message is equivalent
+              // The previous implementation would publish to the topic, but
+              // there would be no subecribers to the topic yet. So dropping the
+              // message is equivalent.
+              // We could wait until the we are done subscribing, but that would
+              // block other messages:
+              // wait >> onMessage(key, message)
               Log[F].debug(s"Received message for $key before the subscription stream has started")
-            // We could wait until the we are done subscribing:
-            // wait >> onMessage(key, message)
-            // But that would block other messages
+
             case Some(Unsubscribing(_))      => Applicative[F].unit
-            case Some(FailedToUnsubscribe()) => Applicative[F].unit
-            case None                        =>
+            case Some(FailedToUnsubscribe()) =>
+              // TODO should we spawn an unsubscribe here?
+              Applicative[F].unit
+            case None =>
               // We expect that all SUBSCRIBE commands are made through
               // `subscribe`. so we should never receive message without
               // subscriptions

@@ -24,86 +24,155 @@ import scala.concurrent.duration._
 
 class SubscriberSuite extends IOSuite {
 
-  test("only call redis subscribe and unsubscribe once when streams finish by themselves") {
-    val channel = RedisChannel("a")
+  private val waitOnFiber: IO[Unit] = IO.sleep(500.millis)
+
+  private val channel1 = RedisChannel("a")
+  private val channel2 = RedisChannel("b")
+
+  test("subscribe and unsubscribe") {
     for {
       subRef <- IO.ref(0)
       unsubRef <- IO.ref(0)
-      map <- make(subRef.update(_ + 1), unsubRef.update(_ + 1))
-      a1 <- map.subscribe(channel).take(3).compile.toList.start
-      a2 <- map.subscribe(channel).take(2).compile.toList.start
-      _ <- IO.sleep(500.millis) // wait for fibers
-      _ <- map.onMessage(channel, "one")
-      _ <- map.onMessage(channel, "two")
-      _ <- map.onMessage(channel, "three")
-      _ <- a1.joinWith(notCanceled).map(assertEquals(_, List("one", "two", "three")))
-      _ <- a2.joinWith(notCanceled).map(assertEquals(_, List("one", "two")))
+      map <- subscriptionMap(subRef.update(_ + 1), unsubRef.update(_ + 1))
+      subscription <- map.subscribe(channel1).compile.toList.start
+      _ <- waitOnFiber
+      _ <- map.unsubscribe(channel1)
+      _ <- subscription.joinWith(notCanceled).map(assertEquals(_, Nil))
       _ <- subRef.get.map(assertEquals(_, 1))
       _ <- unsubRef.get.map(assertEquals(_, 1))
     } yield ()
   }
 
-  test("streams finish on unsubscribe") {
-    val channel = RedisChannel("a")
+  test("subscribe and unsubscribe automatically") {
     for {
+      subRef <- IO.ref(0)
       unsubRef <- IO.ref(0)
-      map <- make(IO.unit, unsubRef.update(_ + 1))
-      a1 <- map.subscribe(channel).compile.toList.start
-      a2 <- map.subscribe(channel).compile.toList.start
-      _ <- IO.sleep(500.millis) // wait for fibers
-      _ <- map.onMessage(channel, "one")
-      _ <- map.onMessage(channel, "two")
-      _ <- map.onMessage(channel, "three")
-      _ <- map.unsubscribe(channel)
-      _ <- a1.joinWith(notCanceled).map(assertEquals(_, List("one", "two", "three")))
-      _ <- a2.joinWith(notCanceled).map(assertEquals(_, List("one", "two", "three")))
+      interrupt <- IO.deferred[Either[Throwable, Unit]]
+      map <- subscriptionMap(subRef.update(_ + 1), unsubRef.update(_ + 1))
+      subscription <- map.subscribe(channel1).interruptWhen(interrupt).compile.toList.start
+      _ <- waitOnFiber
+      _ <- interrupt.complete(Right(()))
+      _ <- subscription.joinWith(notCanceled).map(assertEquals(_, Nil))
+      _ <- subRef.get.map(assertEquals(_, 1))
       _ <- unsubRef.get.map(assertEquals(_, 1))
     } yield ()
   }
 
-  test("handle unsubscribe failure (Active -> FailedToUnsubscribe -> None)") {
-    val channel = RedisChannel("a")
+  test("receive messages") {
     for {
-      unsubRef <- IO.ref(0)
-      map <- make(
-        IO.unit,
-        unsubRef.flatModify {
-          case 0 => (1, IO.raiseError[Unit](new RuntimeException("failed")))
-          case n => (n + 1, IO.unit)
-        }
-      )
-      a <- map.subscribe(channel).compile.toList.start
-      _ <- IO.sleep(500.millis) // wait for fiber
-      _ <- map.onMessage(channel, "one")
-      _ <- map.unsubscribe(channel)
-      _ <- a.join.map(outcome => assert(outcome.isError))
-      _ <- map.counts.map(assertEquals(_, Map(channel -> 0L)))
-      _ <- map.unsubscribe(channel)
+      map <- subscriptionMap(IO.unit, IO.unit)
+      subscription <- map.subscribe(channel1).compile.toList.start
+      _ <- waitOnFiber
+      _ <- map.onMessage(channel1, "one")
+      _ <- map.onMessage(channel1, "two")
+      _ <- map.unsubscribe(channel1)
+      _ <- subscription.joinWith(notCanceled).map(assertEquals(_, List("one", "two")))
+    } yield ()
+  }
+
+  test("subscription count") {
+    for {
+      map <- subscriptionMap(IO.unit, IO.unit)
+      subscription <- map.subscribe(channel1).compile.toList.start
+      _ <- waitOnFiber
+      _ <- map.counts.map(assertEquals(_, Map(channel1 -> 1L)))
+      _ <- map.unsubscribe(channel1)
+      _ <- subscription.joinWith(notCanceled)
       _ <- map.counts.map(assertEquals(_, Map.empty[RedisChannel[String], Long]))
     } yield ()
   }
 
-  test("handle subscribe failure (None -> Subscribing -> None)") {
-    val channel = RedisChannel("a")
+  test("handle multiple subscriptions for the same key") {
+    for {
+      subRef <- IO.ref(0)
+      unsubRef <- IO.ref(0)
+      map <- subscriptionMap(subRef.update(_ + 1), unsubRef.update(_ + 1))
+      subscription1 <- map.subscribe(channel1).take(1).compile.toList.start
+      subscription2 <- map.subscribe(channel1).take(2).compile.toList.start
+      _ <- waitOnFiber
+      _ <- map.onMessage(channel1, "one")
+      _ <- map.onMessage(channel1, "two")
+      _ <- subscription1.joinWith(notCanceled).map(assertEquals(_, List("one")))
+      _ <- subscription2.joinWith(notCanceled).map(assertEquals(_, List("one", "two")))
+      _ <- subRef.get.map(assertEquals(_, 1))
+      _ <- unsubRef.get.map(assertEquals(_, 1))
+    } yield ()
+  }
+
+  test("handle subscriptions to multiple keys") {
+    for {
+      subRef <- IO.ref(List.empty[RedisChannel[String]])
+      unsubRef <- IO.ref(List.empty[RedisChannel[String]])
+      map <- subscriptionMap(c => subRef.update(_ :+ c), c => unsubRef.update(_ :+ c))
+      subscription1 <- map.subscribe(channel1).compile.toList.start
+      subscription2 <- map.subscribe(channel2).take(1).compile.toList.start
+      _ <- waitOnFiber
+      _ <- map.counts.map(assertEquals(_, Map(channel1 -> 1L, channel2 -> 1L)))
+      _ <- map.onMessage(channel1, "one")
+      _ <- map.onMessage(channel2, "two")
+      _ <- map.unsubscribe(channel1)
+      _ <- subscription1.joinWith(notCanceled).map(assertEquals(_, List("one")))
+      _ <- subscription2.joinWith(notCanceled).map(assertEquals(_, List("two")))
+      _ <- map.counts.map(assertEquals(_, Map.empty[RedisChannel[String], Long]))
+      _ <- subRef.get.map(channels => assertEquals(channels.sortBy(_.underlying), List(channel1, channel2)))
+      _ <- unsubRef.get.map(channels => assertEquals(channels.sortBy(_.underlying), List(channel1, channel2)))
+    } yield ()
+  }
+
+  test("handle subscribe failure") {
+    // state changes: None -> Subscribing -> None
     for {
       unsubRef <- IO.ref(0)
-      map <- make(IO.raiseError(new RuntimeException("fail subscribe")), unsubRef.update(_ + 1))
-      a <- map.subscribe(channel).compile.toList.start
-      _ <- IO.sleep(500.millis) // wait for fiber
-      _ <- a.join.map(outcome => assert(outcome.isError))
+      map <- subscriptionMap(IO.raiseError(new RuntimeException("fail subscribe")), unsubRef.update(_ + 1))
+      subscription <- map.subscribe(channel1).compile.toList.start
+      _ <- waitOnFiber
+      _ <- subscription.join.map(outcome => assert(outcome.isError))
       _ <- map.counts.map(assertEquals(_, Map.empty[RedisChannel[String], Long]))
       _ <- unsubRef.get.map(assertEquals(_, 0))
     } yield ()
   }
 
-  private def make(sub: IO[Unit], unsub: IO[Unit]): IO[Subscriber.SubscriptionMap[IO, RedisChannel[String], String]] = {
+  test("handle unsubscribe failure") {
+    // state changes: (None -> Subscribing ->) Active -> FailedToUnsubscribe -> Unsubscribing -> None
+    for {
+      unsubRef <- IO.ref(0)
+      map <- subscriptionMap(
+               IO.unit,
+               unsubRef.flatModify {
+                 case 0 => (1, IO.raiseError[Unit](new RuntimeException("failed")))
+                 case n => (n + 1, IO.unit)
+               }
+             )
+      subscription <- map.subscribe(channel1).compile.toList.start
+      _ <- waitOnFiber
+      _ <- map.onMessage(channel1, "one")
+      _ <- map.unsubscribe(channel1)
+      _ <- subscription.join.map(outcome => assert(outcome.isError))
+      _ <- map.counts.map(assertEquals(_, Map(channel1 -> 0L)))
+      _ <- map.unsubscribe(channel1)
+      _ <- map.counts.map(assertEquals(_, Map.empty[RedisChannel[String], Long]))
+    } yield ()
+  }
+
+  private def subscriptionMap(
+      sub: IO[Unit],
+      unsub: IO[Unit]
+  ): IO[Subscriber.SubscriptionMap[IO, RedisChannel[String], String]] =
+    subscriptionMap(_ => sub, _ => unsub)
+
+  private def subscriptionMap(
+      sub: RedisChannel[String] => IO[Unit],
+      unsub: RedisChannel[String] => IO[Unit]
+  ): IO[Subscriber.SubscriptionMap[IO, RedisChannel[String], String]] = {
     // import effect.Log.Stdout._
     import effect.Log.NoOp._
     Subscriber.SubscriptionMap.singleRef[IO, RedisChannel[String], String](
-      new Subscriber.SubscriptionCommands[IO, RedisChannel[String]]  {
-        override def subscribe(key: RedisChannel[String]): IO[Unit] = sub
-        override def unsubscribe(key: RedisChannel[String]): IO[Unit] = unsub
-      }
+      Subscriber.SubscriptionCommands.withLogs(
+        new Subscriber.SubscriptionCommands[IO, RedisChannel[String]] {
+          override def subscribe(key: RedisChannel[String]): IO[Unit]   = sub(key)
+          override def unsubscribe(key: RedisChannel[String]): IO[Unit] = unsub(key)
+        }
+      )
     )
   }
 
