@@ -20,11 +20,8 @@ package internals
 
 import cats.effect.IO
 import dev.profunktor.redis4cats.data.RedisChannel
-import scala.concurrent.duration._
 
 class SubscriberSuite extends IOSuite {
-
-  private val waitOnFiber: IO[Unit] = IO.sleep(200.millis)
 
   private val channel1 = RedisChannel("a")
   private val channel2 = RedisChannel("b")
@@ -34,10 +31,10 @@ class SubscriberSuite extends IOSuite {
       subRef <- IO.ref(0)
       unsubRef <- IO.ref(0)
       map <- subscriptionMap(subRef.update(_ + 1), unsubRef.update(_ + 1))
-      subscription <- map.subscribe(channel1).compile.toList.start
-      _ <- waitOnFiber
+      subscription <- map.subscribe(channel1).allocated.map(_._1)
+      messages <- subscription.compile.toList.start
       _ <- map.unsubscribe(channel1)
-      _ <- subscription.joinWith(notCanceled).map(assertEquals(_, Nil))
+      _ <- messages.joinWith(notCanceled).map(assertEquals(_, Nil))
       _ <- subRef.get.map(assertEquals(_, 1))
       _ <- unsubRef.get.map(assertEquals(_, 1))
     } yield ()
@@ -49,10 +46,15 @@ class SubscriberSuite extends IOSuite {
       unsubRef <- IO.ref(0)
       interrupt <- IO.deferred[Either[Throwable, Unit]]
       map <- subscriptionMap(subRef.update(_ + 1), unsubRef.update(_ + 1))
-      subscription <- map.subscribe(channel1).interruptWhen(interrupt).compile.toList.start
-      _ <- waitOnFiber
-      _ <- interrupt.complete(Right(()))
-      _ <- subscription.joinWith(notCanceled).map(assertEquals(_, Nil))
+      _ <- map
+             .subscribe(channel1)
+             .flatMap(_.interruptWhen(interrupt).compile.toList.background)
+             .use { getMessages =>
+               for {
+                 _ <- interrupt.complete(Right(()))
+                 _ <- getMessages.flatMap(_.embedError).map(assertEquals(_, Nil))
+               } yield ()
+             }
       _ <- subRef.get.map(assertEquals(_, 1))
       _ <- unsubRef.get.map(assertEquals(_, 1))
     } yield ()
@@ -61,23 +63,23 @@ class SubscriberSuite extends IOSuite {
   test("receive messages") {
     for {
       map <- subscriptionMap(IO.unit, IO.unit)
-      subscription <- map.subscribe(channel1).compile.toList.start
-      _ <- waitOnFiber
+      subscription <- map.subscribe(channel1).allocated.map(_._1)
+      messages <- subscription.compile.toList.start
       _ <- map.onMessage(channel1, "one")
       _ <- map.onMessage(channel1, "two")
       _ <- map.unsubscribe(channel1)
-      _ <- subscription.joinWith(notCanceled).map(assertEquals(_, List("one", "two")))
+      _ <- messages.joinWith(notCanceled).map(assertEquals(_, List("one", "two")))
     } yield ()
   }
 
   test("subscription count") {
     for {
       map <- subscriptionMap(IO.unit, IO.unit)
-      subscription <- map.subscribe(channel1).compile.toList.start
-      _ <- waitOnFiber
+      subscription <- map.subscribe(channel1).allocated.map(_._1)
+      messages <- subscription.compile.toList.start
       _ <- map.counts.map(assertEquals(_, Map(channel1 -> 1L)))
       _ <- map.unsubscribe(channel1)
-      _ <- subscription.joinWith(notCanceled)
+      _ <- messages.joinWith(notCanceled)
       _ <- map.counts.map(assertEquals(_, Map.empty[RedisChannel[String], Long]))
     } yield ()
   }
@@ -87,13 +89,14 @@ class SubscriberSuite extends IOSuite {
       subRef <- IO.ref(0)
       unsubRef <- IO.ref(0)
       map <- subscriptionMap(subRef.update(_ + 1), unsubRef.update(_ + 1))
-      subscription1 <- map.subscribe(channel1).take(1).compile.toList.start
-      subscription2 <- map.subscribe(channel1).take(2).compile.toList.start
-      _ <- waitOnFiber
+      subscription1 <- map.subscribe(channel1).allocated.map(_._1)
+      messages1 <- subscription1.take(1).compile.toList.start
+      subscription2 <- map.subscribe(channel1).allocated.map(_._1)
+      messages2 <- subscription2.take(2).compile.toList.start
       _ <- map.onMessage(channel1, "one")
       _ <- map.onMessage(channel1, "two")
-      _ <- subscription1.joinWith(notCanceled).map(assertEquals(_, List("one")))
-      _ <- subscription2.joinWith(notCanceled).map(assertEquals(_, List("one", "two")))
+      _ <- messages1.joinWith(notCanceled).map(assertEquals(_, List("one")))
+      _ <- messages2.joinWith(notCanceled).map(assertEquals(_, List("one", "two")))
       _ <- subRef.get.map(assertEquals(_, 1))
       _ <- unsubRef.get.map(assertEquals(_, 1))
     } yield ()
@@ -104,15 +107,16 @@ class SubscriberSuite extends IOSuite {
       subRef <- IO.ref(List.empty[RedisChannel[String]])
       unsubRef <- IO.ref(List.empty[RedisChannel[String]])
       map <- subscriptionMap(c => subRef.update(_ :+ c), c => unsubRef.update(_ :+ c))
-      subscription1 <- map.subscribe(channel1).compile.toList.start
-      subscription2 <- map.subscribe(channel2).take(1).compile.toList.start
-      _ <- waitOnFiber
+      subscription1 <- map.subscribe(channel1).allocated.map(_._1)
+      messages1 <- subscription1.compile.toList.start
+      subscription2 <- map.subscribe(channel2).allocated.map(_._1)
+      messages2 <- subscription2.take(1).compile.toList.start
       _ <- map.counts.map(assertEquals(_, Map(channel1 -> 1L, channel2 -> 1L)))
       _ <- map.onMessage(channel1, "one")
       _ <- map.onMessage(channel2, "two")
       _ <- map.unsubscribe(channel1)
-      _ <- subscription1.joinWith(notCanceled).map(assertEquals(_, List("one")))
-      _ <- subscription2.joinWith(notCanceled).map(assertEquals(_, List("two")))
+      _ <- messages1.joinWith(notCanceled).map(assertEquals(_, List("one")))
+      _ <- messages2.joinWith(notCanceled).map(assertEquals(_, List("two")))
       _ <- map.counts.map(assertEquals(_, Map.empty[RedisChannel[String], Long]))
       _ <- subRef.get.map(channels => assertEquals(channels.sortBy(_.underlying), List(channel1, channel2)))
       _ <- unsubRef.get.map(channels => assertEquals(channels.sortBy(_.underlying), List(channel1, channel2)))
@@ -124,9 +128,7 @@ class SubscriberSuite extends IOSuite {
     for {
       unsubRef <- IO.ref(0)
       map <- subscriptionMap(IO.raiseError(new RuntimeException("fail subscribe")), unsubRef.update(_ + 1))
-      subscription <- map.subscribe(channel1).compile.toList.start
-      _ <- waitOnFiber
-      _ <- subscription.join.map(outcome => assert(outcome.isError))
+      _ <- map.subscribe(channel1).allocated.attempt.map(attempt => assert(attempt.isLeft))
       _ <- map.counts.map(assertEquals(_, Map.empty[RedisChannel[String], Long]))
       _ <- unsubRef.get.map(assertEquals(_, 0))
     } yield ()
@@ -143,11 +145,11 @@ class SubscriberSuite extends IOSuite {
                  case n => (n + 1, IO.unit)
                }
              )
-      subscription <- map.subscribe(channel1).compile.toList.start
-      _ <- waitOnFiber
+      subscription <- map.subscribe(channel1).allocated.map(_._1)
+      messages <- subscription.compile.toList.start
       _ <- map.onMessage(channel1, "one")
       _ <- map.unsubscribe(channel1)
-      _ <- subscription.join.map(outcome => assert(outcome.isError))
+      _ <- messages.join.map(outcome => assert(outcome.isError))
       _ <- map.counts.map(assertEquals(_, Map(channel1 -> 0L)))
       _ <- map.unsubscribe(channel1)
       _ <- map.counts.map(assertEquals(_, Map.empty[RedisChannel[String], Long]))
@@ -164,8 +166,8 @@ class SubscriberSuite extends IOSuite {
       sub: RedisChannel[String] => IO[Unit],
       unsub: RedisChannel[String] => IO[Unit]
   ): IO[Subscriber.SubscriptionMap[IO, RedisChannel[String], String]] = {
-    // import effect.Log.Stdout._
-    import effect.Log.NoOp._
+    import effect.Log.Stdout._
+    // import effect.Log.NoOp._
     Subscriber.SubscriptionMap.singleRef[IO, RedisChannel[String], String](
       Subscriber.SubscriptionCommands.withLogs(
         Subscriber.SubscriptionCommands[IO, RedisChannel[String]](sub, unsub)
